@@ -5,7 +5,7 @@ import javax.ws.rs._
 import javax.ws.rs.core.Response.Status
 import javax.ws.rs.core.{MediaType, Response}
 
-import org.apache.mesos.chronos.scheduler.config.{CassandraConfiguration, SchedulerConfiguration}
+import org.apache.mesos.chronos.scheduler.config.{MongoConfiguration, SchedulerConfiguration}
 import org.apache.mesos.chronos.scheduler.graph.JobGraph
 import org.apache.mesos.chronos.scheduler.jobs._
 
@@ -30,7 +30,7 @@ import scala.collection.mutable.ListBuffer
 class JobManagementResource @Inject()(val jobScheduler: JobScheduler,
                                       val jobGraph: JobGraph,
                                       val configuration: SchedulerConfiguration,
-                                      val cassandraConfig: CassandraConfiguration,
+                                      val MongoConfig: MongoConfiguration,
                                       val jobStats: JobStats,
                                       val jobMetrics: JobMetrics) {
 
@@ -125,7 +125,7 @@ class JobManagementResource @Inject()(val jobScheduler: JobScheduler,
       require(jobOpt.nonEmpty, "Job '%s' not found".format(jobName))
 
       val histoStats = jobMetrics.getJobHistogramStats(jobName)
-      val jobStatsList: List[TaskStat] = jobStats.getMostRecentTaskStatsByJob(jobOpt.get, cassandraConfig.jobHistoryLimit())
+      val jobStatsList: List[TaskStat] = jobStats.getMostRecentTaskStatsByJob(jobOpt.get, MongoConfig.jobHistoryLimit())
       val jobStatsWrapper = new JobStatWrapper(jobStatsList, histoStats)
 
       val wrapperStr = objectMapper.writeValueAsString(jobStatsWrapper)

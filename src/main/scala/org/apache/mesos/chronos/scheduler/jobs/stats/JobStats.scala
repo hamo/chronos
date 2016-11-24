@@ -1,30 +1,34 @@
 package org.apache.mesos.chronos.scheduler.jobs.stats
 
 import scala.collection._
-import java.util.concurrent.ConcurrentHashMap
 import java.util.logging.{Level, Logger}
 
-import com.datastax.driver.core.exceptions.{DriverException, NoHostAvailableException, QueryExecutionException, QueryValidationException}
-import com.datastax.driver.core.querybuilder.{Insert, QueryBuilder}
-import com.datastax.driver.core._
+import org.mongodb.scala.{Completed, Document, MongoClient, MongoCollection}
+import org.mongodb.scala.bson.collection.mutable.{Document => MutableDocument}
+import org.mongodb.scala.model.Filters
+import org.mongodb.scala.bson._
+import org.mongodb.scala.model.Updates.inc
+import org.mongodb.scala.model.Indexes._
 import com.google.inject.Inject
 import org.apache.mesos.Protos.{TaskState, TaskStatus}
-import org.apache.mesos.chronos.scheduler.config.CassandraConfiguration
+import org.apache.mesos.chronos.scheduler.config.MongoConfiguration
 import org.apache.mesos.chronos.scheduler.jobs._
 import org.joda.time.DateTime
 
 import scala.collection.JavaConverters._
+import scala.concurrent.Await
+import scala.concurrent.duration.Duration
 
 object CurrentState extends Enumeration {
   type CurrentState = Value
   val idle, queued, running = Value
 }
 
-class JobStats @Inject()(clusterBuilder: Option[Cluster.Builder], config: CassandraConfiguration) {
+class JobStats @Inject()(config: MongoConfiguration) {
 
-  // Cassandra table column names
+  // Mongodb document column names
   private val ATTEMPT: String = "attempt"
-  private val ELEMENTS_PROCESSED = "elements_processed"
+  private val ELEMENTS_PROCESSED: String = "elements_processed"
   private val IS_FAILURE: String = "is_failure"
   private val JOB_NAME: String = "job_name"
   private val JOB_OWNER: String = "job_owner"
@@ -32,23 +36,22 @@ class JobStats @Inject()(clusterBuilder: Option[Cluster.Builder], config: Cassan
   private val JOB_SCHEDULE: String = "job_schedule"
   private val MESSAGE: String = "message"
   private val SLAVE_ID: String = "slave_id"
-  private val TASK_ID: String  = "id"
+  private val TASK_ID: String = "id"
   private val TASK_STATE: String = "task_state"
   private val TIMESTAMP: String = "ts"
 
   protected val jobStates = new mutable.HashMap[String, CurrentState.Value]()
 
   val log = Logger.getLogger(getClass.getName)
-  val statements = new ConcurrentHashMap[String, PreparedStatement]().asScala
-  var _session: Option[Session] = None
+  var _mongoClient: Option[MongoClient] = None
 
-  def getJobState(jobName: String) : CurrentState.Value = {
+  def getJobState(jobName: String): CurrentState.Value = {
     /**
-     * NOTE: currently everything stored in memory, look into moving
-     * this to Cassandra. ZK is not an option cause serializers and
-     * deserializers need to be written. Need a good solution, potentially
-     * lots of writes and very few reads (only on failover)
-     */
+      * NOTE: currently everything stored in memory, look into moving
+      * this to Cassandra. ZK is not an option cause serializers and
+      * deserializers need to be written. Need a good solution, potentially
+      * lots of writes and very few reads (only on failover)
+      */
     jobStates.getOrElse(jobName, CurrentState.idle)
   }
 
@@ -67,45 +70,38 @@ class JobStats @Inject()(clusterBuilder: Option[Cluster.Builder], config: Cassan
   private def removeJobState(job: BaseJob) = jobStates.remove(job.name)
 
   /**
-   * Queries Cassandra table for past and current job statistics by jobName
-   * and limits by numTasks. The result is not sorted by execution time
-   * @param job job to find task data for
-   * @return list of cassandra rows
-   */
-  private def getTaskDataByJob(job: BaseJob): Option[List[Row]] = {
-    var rowsListFinal: Option[List[Row]] = None
-    try {
-      getSession match {
-        case Some(session: Session) =>
-          val query = s"SELECT * FROM ${config.cassandraTable()} WHERE $JOB_NAME='${job.name}';"
-          val prepared = statements.getOrElseUpdate(query,
-            session.prepare(
-              new SimpleStatement(query)
-                .setConsistencyLevel(readConsistencyLevel())
-                .asInstanceOf[RegularStatement]
-            )
-          )
+    * Queries Mongo collection for past and current job statistics by jobName
+    * and limits by numTasks. The result is not sorted by execution time
+    *
+    * @param job job to find task data for
+    * @return list of Mongo documents
+    */
+  private def getTaskDataByJob(job: BaseJob): Option[List[Document]] = {
+    var rowsListFinal: Option[List[Document]] = None
 
-          val resultSet = session.execute(prepared.bind())
-          val rowsList = resultSet.all().asScala.toList
-          rowsListFinal = Some(rowsList)
-        case None => rowsListFinal = None
-      }
-    } catch {
-      case e: NoHostAvailableException =>
-        resetSession()
-        log.log(Level.WARNING, "No hosts were available, will retry next time.", e)
-      case e: QueryExecutionException =>
-        log.log(Level.WARNING,"Query execution failed:", e)
-      case e: QueryValidationException =>
-        log.log(Level.WARNING,"Query validation failed:", e)
+    getClient match {
+      case Some(client: MongoClient) =>
+        val collection = client.getDatabase(config.mongoDatabase()).getCollection(config.mongoCollection())
+        val query = collection.find(Filters.equal(JOB_NAME, job.name)).toFuture()
+
+        try {
+          // FIXME: better await timeout value
+          val docs = Await.result(query, Duration.Inf)
+          rowsListFinal = Some(docs.toList)
+        } catch {
+          case ex: java.util.concurrent.TimeoutException => log.log(Level.WARNING, "query Mongodb timeout", ex)
+          case ex: Throwable =>
+            log.log(Level.WARNING, "query Mongodb error", ex)
+            closeClient()
+        }
+      case None => {}
     }
     rowsListFinal
   }
 
   /**
-   * Compare function for TaskStat by most recent date.
-   */
+    * Compare function for TaskStat by most recent date.
+    */
   private def recentDateCompareFnc(a: TaskStat, b: TaskStat): Boolean = {
     val compareAscDate = a.taskStartTs match {
       case Some(aTs: DateTime) =>
@@ -119,118 +115,116 @@ class JobStats @Inject()(clusterBuilder: Option[Cluster.Builder], config: Cassan
   }
 
   /**
-   * Queries Cassandra stat table to get the element processed count
-   * for a specific job and a specific task
-   * @param job job to find stats for
-   * @param taskId task id for which to find stats for
-   * @return element processed count
-   */
+    * Queries Mongodb stat collection to get the element processed count
+    * for a specific job and a specific task
+    *
+    * @param job    job to find stats for
+    * @param taskId task id for which to find stats for
+    * @return element processed count
+    */
   private def getTaskStatCount(job: BaseJob, taskId: String): Option[Long] = {
     var taskStatCount: Option[Long] = None
-    try {
-      getSession.foreach {
-        session =>
-          val query = s"SELECT * FROM ${config.cassandraStatCountTable()} WHERE job_name='${job.name}' AND task_id='$taskId';"
-          val prepared = statements.getOrElseUpdate(query,
-            session.prepare(
-              new SimpleStatement(query)
-                .setConsistencyLevel(readConsistencyLevel())
-                .asInstanceOf[RegularStatement]
-            )
-          )
-          val resultSet = session.execute(prepared.bind())
 
-          //should just be one row
-          val resultRow = resultSet.one()
-          if (resultRow != null) {
-            val cDef = resultRow.getColumnDefinitions
-            if (cDef.contains(ELEMENTS_PROCESSED)) {
-              taskStatCount = Some(resultRow.getLong(ELEMENTS_PROCESSED))
+    getClient.foreach {
+      client =>
+        val collection = client.getDatabase(config.mongoDatabase()).getCollection(config.mongoStatCountCollection())
+        val query = collection.find(Filters.and(Filters.equal(JOB_NAME, job.name), Filters.equal(TASK_ID, taskId))).first().toFuture()
+
+        try {
+          // FIXME: better await timeout value
+          val docs = Await.result(query, Duration.Inf)
+
+          if (docs.size > 0) {
+            val doc = docs.head
+            if (doc.contains(ELEMENTS_PROCESSED)) {
+              doc.get(ELEMENTS_PROCESSED) match {
+                case Some(l) =>
+                  taskStatCount = Some(l.asInt64().longValue())
+                case _ =>
+              }
             }
-          } else {
-            log.info("No elements processed count found for job_name %s taskId %s".format(job.name, taskId))
           }
-      }
-    } catch {
-      case e: NoHostAvailableException =>
-        resetSession()
-        log.log(Level.WARNING, "No hosts were available, will retry next time.", e)
-      case e: QueryExecutionException =>
-        log.log(Level.WARNING,"Query execution failed:", e)
-      case e: QueryValidationException =>
-        log.log(Level.WARNING,"Query validation failed:", e)
+        } catch {
+          case ex: java.util.concurrent.TimeoutException => log.log(Level.WARNING, "query Mongodb timeout", ex)
+          case ex: Throwable =>
+            log.log(Level.WARNING, "query Mongodb error", ex)
+            closeClient()
+        }
     }
+
     taskStatCount
   }
 
   /**
-   * Determines if row from Cassandra represents a valid Mesos task
-   * @param row cassandra row
-   * @return true if valid, false otherwise
-   */
-  private def isValidTaskData(row: Row): Boolean = {
-    if (row == null) {
+    * Determines if doc from Mongodb represents a valid Mesos task
+    *
+    * @param doc Mongodb document
+    * @return true if valid, false otherwise
+    */
+  private def isValidTaskData(doc: Document): Boolean = {
+    if (doc == null) {
       false
     } else {
-      val cDefs = row.getColumnDefinitions
-      cDefs.contains(JOB_NAME) &&
-        cDefs.contains(TASK_ID) &&
-        cDefs.contains(TIMESTAMP) &&
-        cDefs.contains(TASK_STATE) &&
-        cDefs.contains(SLAVE_ID) &&
-        cDefs.contains(IS_FAILURE)
+      doc.contains(JOB_NAME) &&
+        doc.contains(TASK_ID) &&
+        doc.contains(TIMESTAMP) &&
+        doc.contains(TASK_STATE) &&
+        doc.contains(SLAVE_ID)
     }
   }
 
   private val terminalStates = Set(TaskState.TASK_FINISHED, TaskState.TASK_FAILED, TaskState.TASK_KILLED, TaskState.TASK_LOST).map(_.toString)
+
   /**
-   * Parses the contents of the data row and updates the TaskStat object
-   * @param taskStat task stat to be updated
-   * @param row data row from which to update the task stat object
-   * @return updated TaskStat object
-   */
-  private def updateTaskStat(taskStat: TaskStat, row: Row): TaskStat = {
-    val taskTimestamp = row.getDate(TIMESTAMP)
-    val taskState = row.getString(TASK_STATE)
+    * Parses the contents of the data doc and updates the TaskStat object
+    *
+    * @param taskStat task stat to be updated
+    * @param doc      data document from which to update the task stat object
+    * @return updated TaskStat object
+    */
+  private def updateTaskStat(taskStat: TaskStat, doc: Document): TaskStat = {
+    val taskTimestamp = new java.util.Date(doc(TIMESTAMP).asDateTime().getValue)
+    val taskState = doc(TASK_STATE).asString().getValue
 
     if (taskState == TaskState.TASK_RUNNING.toString) {
       taskStat.setTaskStartTs(taskTimestamp)
       taskStat.setTaskStatus(ChronosTaskStatus.Running)
     } else if (terminalStates.contains(taskState)) {
-        taskStat.setTaskEndTs(taskTimestamp)
-        val status = if (TaskState.TASK_FINISHED.toString == taskState) ChronosTaskStatus.Success else ChronosTaskStatus.Fail
-        taskStat.setTaskStatus(status)
+      taskStat.setTaskEndTs(taskTimestamp)
+      val status = if (TaskState.TASK_FINISHED.toString == taskState) ChronosTaskStatus.Success else ChronosTaskStatus.Fail
+      taskStat.setTaskStatus(status)
     }
 
     taskStat
   }
 
   /**
-   * Returns a list of tasks (TaskStat) found for the specified job name
-   * @param job job to search for task stats
-   * @return list of past and current running tasks for the job
-   */
+    * Returns a list of tasks (TaskStat) found for the specified job name
+    *
+    * @param job job to search for task stats
+    * @return list of past and current running tasks for the job
+    */
   private def getParsedTaskStatsByJob(job: BaseJob): List[TaskStat] = {
     val taskMap = mutable.Map[String, TaskStat]()
 
     getTaskDataByJob(job).fold {
       log.info("No row list found for jobName=%s".format(job.name))
     } {
-      rowsList =>
-        for (row <- rowsList) {
+      docsList =>
+        for (doc <- docsList) {
           /*
-           * Go through all the rows and construct a job history.
+           * Go through all the docs and construct a job history.
            * Group elements by task id
            */
-          if (isValidTaskData(row)) {
-            val taskId = row.getString(TASK_ID)
+          if (isValidTaskData(doc)) {
+            val taskId = doc(TASK_ID).asString().getValue
             val taskStat = taskMap.getOrElseUpdate(taskId,
-                new TaskStat(taskId,
-                    row.getString(JOB_NAME),
-                    row.getString(SLAVE_ID)))
-            updateTaskStat(taskStat, row)
+              new TaskStat(taskId,
+                doc(JOB_NAME).asString().getValue,
+                doc(SLAVE_ID).asString().getValue))
+            updateTaskStat(taskStat, doc)
           } else {
-            log.info("Invalid row found in cassandra table for jobName=%s".format(job.name))
+            log.info("Invalid document found in Mongodb collection for jobName=%s".format(job.name))
           }
         }
     }
@@ -239,12 +233,13 @@ class JobStats @Inject()(clusterBuilder: Option[Cluster.Builder], config: Cassan
   }
 
   /**
-   * Returns most recent tasks by job and returns only numTasks
-   * @param job job to search the tasks for
-   * @param numTasks maximum number of tasks to return
-   * @return returns a list of past and currently running tasks,
-   *         the first element is the most recent.
-   */
+    * Returns most recent tasks by job and returns only numTasks
+    *
+    * @param job      job to search the tasks for
+    * @param numTasks maximum number of tasks to return
+    * @return returns a list of past and currently running tasks,
+    *         the first element is the most recent.
+    */
   def getMostRecentTaskStatsByJob(job: BaseJob, numTasks: Int): List[TaskStat] = {
 
     val sortedDescTaskStatList = getParsedTaskStatsByJob(job).sortWith(recentDateCompareFnc).slice(0, numTasks)
@@ -263,54 +258,39 @@ class JobStats @Inject()(clusterBuilder: Option[Cluster.Builder], config: Cassan
   }
 
   /**
-   * Updates the number of elements processed by a task. This method
-   * is not idempotent
-   * @param job job for which to perform the update
-   * @param taskId task id for which to perform the update
-   * @param additionalElementsProcessed number of elements to increment bt
-   */
+    * Updates the number of elements processed by a task. This method
+    * is not idempotent
+    *
+    * @param job                         job for which to perform the update
+    * @param taskId                      task id for which to perform the update
+    * @param additionalElementsProcessed number of elements to increment bt
+    */
   def updateTaskProgress(job: BaseJob,
-      taskId: String,
-      additionalElementsProcessed: Long) {
-    try {
-      getSession.foreach {
-        session =>
-          val validateQuery = s"SELECT * FROM ${config.cassandraTable()} WHERE job_name='${job.name}' AND id='$taskId';"
-          var prepared = statements.getOrElseUpdate(validateQuery, {
-            session.prepare(
-              new SimpleStatement(validateQuery)
-                .setConsistencyLevel(readConsistencyLevel())
-                .asInstanceOf[RegularStatement]
-            )
-          })
-          val validateResultSet = session.execute(prepared.bind())
+                         taskId: String,
+                         additionalElementsProcessed: Long) {
+    getClient.foreach {
+      client =>
+        val mainCollection = client.getDatabase(config.mongoDatabase()).getCollection(config.mongoCollection())
+        val statCountCollection = client.getDatabase(config.mongoDatabase()).getCollection(config.mongoStatCountCollection())
 
-          if (validateResultSet.one() != null) {
-            /*
-             * Only update stat count if entry exists in main table.
-             */
-            val query = s"UPDATE ${config.cassandraStatCountTable()}"+
-              s" SET elements_processed = elements_processed + $additionalElementsProcessed"+
-              s" WHERE job_name='${job.name}' AND task_id='$taskId';"
-            prepared = statements.getOrElseUpdate(query,
-              session.prepare(
-                new SimpleStatement(query)
-                  .asInstanceOf[RegularStatement]
-              )
-            )
-          } else {
-            throw new IllegalArgumentException("Task id  %s not found".format(taskId))
-          }
-          session.executeAsync(prepared.bind())
-      }
-    } catch {
-      case e: NoHostAvailableException =>
-        resetSession()
-        log.log(Level.WARNING, "No hosts were available, will retry next time.", e)
-      case e: QueryExecutionException =>
-        log.log(Level.WARNING,"Query execution failed:", e)
-      case e: QueryValidationException =>
-        log.log(Level.WARNING,"Query validation failed:", e)
+        // FIXME: refactor to chained Observable
+        try {
+          // 1. Query main collection to make sure task exists
+          val existQuery = mainCollection.find(Filters.and(Filters.equal(JOB_NAME, job.name), Filters.equal(TASK_ID, taskId))).toFuture()
+          // FIXME: better await timeout value
+          val docs = Await.result(existQuery, Duration.Inf)
+          if (docs.size == 0) throw new IllegalArgumentException("Task id  %s not found".format(taskId))
+
+          // 2. Update stat count collection
+          val updateQuery = statCountCollection.updateOne(Filters.and(Filters.equal(JOB_NAME, job.name), Filters.equal(TASK_ID, taskId)), inc(ELEMENTS_PROCESSED, additionalElementsProcessed)).toFuture()
+          Await.result(updateQuery, Duration.Inf)
+        } catch {
+          case ex: IllegalArgumentException => throw ex
+          case ex: java.util.concurrent.TimeoutException => log.log(Level.WARNING, "query mongodb timeout", ex)
+          case ex: Throwable =>
+            log.log(Level.WARNING, "query mongodb error", ex)
+            closeClient()
+        }
     }
   }
 
@@ -330,8 +310,8 @@ class JobStats @Inject()(clusterBuilder: Option[Cluster.Builder], config: Cassan
   private def jobStarted(job: BaseJob, taskStatus: TaskStatus, attempt: Int) {
     updateJobState(job.name, CurrentState.running)
 
-    var jobSchedule:Option[String] = None
-    var jobParents:Option[java.util.Set[String]] = None
+    var jobSchedule: Option[String] = None
+    var jobParents: Option[java.util.Set[String]] = None
     job match {
       case job: ScheduleBasedJob =>
         jobSchedule = Some(job.schedule)
@@ -339,99 +319,24 @@ class JobStats @Inject()(clusterBuilder: Option[Cluster.Builder], config: Cassan
         jobParents = Some(job.parents.asJava)
     }
     insertToStatTable(
-            id=Some(taskStatus.getTaskId.getValue),
-            timestamp=Some(new java.util.Date()),
-            jobName=Some(job.name),
-            jobOwner=Some(job.owner),
-            jobSchedule=jobSchedule,
-            jobParents=jobParents,
-            taskState=Some(taskStatus.getState.toString),
-            slaveId=Some(taskStatus.getSlaveId.getValue),
-            message=None,
-            attempt=Some(attempt),
-            isFailure=None)
-  }
-
-  def getSession: Option[Session] = {
-    _session match {
-      case Some(s) => Some(s)
-      case None =>
-        clusterBuilder match {
-          case Some(c) =>
-            try {
-              val session = c.build.connect()
-              session.execute(new SimpleStatement(
-                s"USE ${config.cassandraKeyspace()};"
-              ))
-
-              session.execute(new SimpleStatement(
-                s"CREATE TABLE IF NOT EXISTS ${config.cassandraTable()}" +
-                  """
-                    |(
-                    |   id             VARCHAR,
-                    |   ts             TIMESTAMP,
-                    |   job_name       VARCHAR,
-                    |   job_owner      VARCHAR,
-                    |   job_schedule   VARCHAR,
-                    |   job_parents    SET<VARCHAR>,
-                    |   task_state     VARCHAR,
-                    |   slave_id       VARCHAR,
-                    |   message        VARCHAR,
-                    |   attempt        INT,
-                    |   is_failure     BOOLEAN,
-                    | PRIMARY KEY (id, ts))
-                    | WITH bloom_filter_fp_chance=0.100000 AND
-                    | compaction = {'class':'LeveledCompactionStrategy'}
-                  """.stripMargin
-              ))
-              session.execute(new SimpleStatement(
-                s"CREATE INDEX IF NOT EXISTS ON ${config.cassandraTable()} ($JOB_NAME);"
-              ))
-
-              /*
-               * highest bloom filter to reduce memory consumption and reducing
-               * false positives
-               */
-              session.execute(new SimpleStatement(
-                s"CREATE TABLE IF NOT EXISTS ${config.cassandraStatCountTable()}" +
-                  """
-                    |(
-                    |   task_id              VARCHAR,
-                    |   job_name             VARCHAR,
-                    |   elements_processed   COUNTER,
-                    | PRIMARY KEY (job_name, task_id))
-                    | WITH bloom_filter_fp_chance=0.100000 AND
-                    | compaction = {'class':'LeveledCompactionStrategy'}
-                  """.stripMargin
-              ))
-
-              _session = Some(session)
-              _session
-            } catch {
-              case e: DriverException =>
-                log.log(Level.WARNING, "Caught exception when creating Cassandra JobStats session", e)
-                None
-            }
-          case None => None
-        }
-    }
-  }
-
-  def resetSession() {
-    statements.clear()
-    _session match {
-      case Some(session) =>
-        session.close()
-      case _ =>
-    }
-    _session = None
+      id = Some(taskStatus.getTaskId.getValue),
+      timestamp = Some(new java.util.Date()),
+      jobName = Some(job.name),
+      jobOwner = Some(job.owner),
+      jobSchedule = jobSchedule,
+      jobParents = jobParents,
+      taskState = Some(taskStatus.getState.toString),
+      slaveId = Some(taskStatus.getSlaveId.getValue),
+      message = None,
+      attempt = Some(attempt),
+      isFailure = None)
   }
 
   private def jobFinished(job: BaseJob, taskStatus: TaskStatus, attempt: Int) {
     updateJobState(job.name, CurrentState.idle)
 
-    var jobSchedule:Option[String] = None
-    var jobParents:Option[java.util.Set[String]] = None
+    var jobSchedule: Option[String] = None
+    var jobParents: Option[java.util.Set[String]] = None
     job match {
       case job: ScheduleBasedJob =>
         jobSchedule = Some(job.schedule)
@@ -439,22 +344,22 @@ class JobStats @Inject()(clusterBuilder: Option[Cluster.Builder], config: Cassan
         jobParents = Some(job.parents.asJava)
     }
     insertToStatTable(
-            id=Some(taskStatus.getTaskId.getValue),
-            timestamp=Some(new java.util.Date()),
-            jobName=Some(job.name),
-            jobOwner=Some(job.owner),
-            jobSchedule=jobSchedule,
-            jobParents=jobParents,
-            taskState=Some(taskStatus.getState.toString),
-            slaveId=Some(taskStatus.getSlaveId.getValue),
-            message=None,
-            attempt=Some(attempt),
-            isFailure=None)
+      id = Some(taskStatus.getTaskId.getValue),
+      timestamp = Some(new java.util.Date()),
+      jobName = Some(job.name),
+      jobOwner = Some(job.owner),
+      jobSchedule = jobSchedule,
+      jobParents = jobParents,
+      taskState = Some(taskStatus.getState.toString),
+      slaveId = Some(taskStatus.getSlaveId.getValue),
+      message = None,
+      attempt = Some(attempt),
+      isFailure = Some(false))
   }
 
   private def jobFailed(jobNameOrJob: Either[String, BaseJob], taskStatus: TaskStatus, attempt: Int): Unit = {
     val jobName = jobNameOrJob.fold(name => name, _.name)
-    val jobSchedule = jobNameOrJob.fold(_ => None,  {
+    val jobSchedule = jobNameOrJob.fold(_ => None, {
       case job: ScheduleBasedJob => Some(job.schedule)
       case _ => None
     })
@@ -465,101 +370,120 @@ class JobStats @Inject()(clusterBuilder: Option[Cluster.Builder], config: Cassan
 
     updateJobState(jobName, CurrentState.idle)
     insertToStatTable(
-      id=Some(taskStatus.getTaskId.getValue),
-      timestamp=Some(new java.util.Date()),
-      jobName=Some(jobName),
-      jobOwner=jobNameOrJob.fold(_ => None, job => Some(job.owner)),
-      jobSchedule=jobSchedule,
-      jobParents=jobParents,
-      taskState=Some(taskStatus.getState.toString),
-      slaveId=Some(taskStatus.getSlaveId.getValue),
-      message=Some(taskStatus.getMessage),
-      attempt=Some(attempt),
-      isFailure=Some(true))
+      id = Some(taskStatus.getTaskId.getValue),
+      timestamp = Some(new java.util.Date()),
+      jobName = Some(jobName),
+      jobOwner = jobNameOrJob.fold(_ => None, job => Some(job.owner)),
+      jobSchedule = jobSchedule,
+      jobParents = jobParents,
+      taskState = Some(taskStatus.getState.toString),
+      slaveId = Some(taskStatus.getSlaveId.getValue),
+      message = Some(taskStatus.getMessage),
+      attempt = Some(attempt),
+      isFailure = Some(true))
   }
 
   /**
-   * Helper method that performs an insert statement to update the
-   * job statistics (chronos) table. All arguments are surrounded
-   * by options so that a subset of values can be inserted.
-   */
+    * Helper method that performs an insert statement to update the
+    * job statistics (chronos) table. All arguments are surrounded
+    * by options so that a subset of values can be inserted.
+    */
   private def insertToStatTable(id: Option[String],
-      timestamp: Option[java.util.Date],
-      jobName: Option[String],
-      jobOwner: Option[String],
-      jobSchedule: Option[String],
-      jobParents: Option[java.util.Set[String]],
-      taskState: Option[String],
-      slaveId: Option[String],
-      message: Option[String],
-      attempt: Option[Integer],
-      isFailure: Option[Boolean]) = {
-    try {
-      getSession.foreach {
-        session =>
-          val query:Insert = QueryBuilder.insertInto(config.cassandraTable())
+                                timestamp: Option[java.util.Date],
+                                jobName: Option[String],
+                                jobOwner: Option[String],
+                                jobSchedule: Option[String],
+                                jobParents: Option[java.util.Set[String]],
+                                taskState: Option[String],
+                                slaveId: Option[String],
+                                message: Option[String],
+                                attempt: Option[Integer],
+                                isFailure: Option[Boolean]) = {
 
-          //set required values (let these throw an exception)
-          query.value(TASK_ID , id.get)
-            .value(JOB_NAME , jobName.get)
-            .value(TIMESTAMP , timestamp.get)
+    getClient.foreach {
+      client =>
+        val doc = MutableDocument(TASK_ID -> id.get, JOB_NAME -> jobName.get, TIMESTAMP -> timestamp.get)
 
-          jobOwner match {
-            case Some(jo: String) => query.value(JOB_OWNER , jo)
-            case _ =>
-          }
-          jobSchedule match {
-            case Some(js: String) => query.value(JOB_SCHEDULE , js)
-            case _ =>
-          }
-          jobParents match {
-            case Some(jp: java.util.Set[String]) => query.value(JOB_PARENTS , jp)
-            case _ =>
-          }
-          taskState match {
-            case Some(ts: String) => query.value(TASK_STATE , ts)
-            case _ =>
-          }
-          slaveId match {
-            case Some(s: String) => query.value(SLAVE_ID , s)
-            case _ =>
-          }
-          message match {
-            case Some(m: String) => query.value(MESSAGE , m)
-            case _ =>
-          }
-          attempt match {
-            case Some(a: Integer) => query.value(ATTEMPT , a)
-            case _ =>
-          }
-          isFailure match {
-            case Some(f: Boolean) => query.value(IS_FAILURE , f)
-            case _ =>
-          }
+        jobOwner match {
+          case Some(jo: String) => doc.update(JOB_OWNER, jo)
+          case _ =>
+        }
+        jobSchedule match {
+          case Some(js: String) => doc.update(JOB_SCHEDULE, js)
+          case _ =>
+        }
+        jobParents match {
+          case Some(jp: java.util.Set[String]) => doc.update(JOB_PARENTS, jp.asScala.toList)
+          case _ =>
+        }
+        taskState match {
+          case Some(ts: String) => doc.update(TASK_STATE, ts)
+          case _ =>
+        }
+        slaveId match {
+          case Some(s: String) => doc.update(SLAVE_ID, s)
+          case _ =>
+        }
+        message match {
+          case Some(m: String) => doc.update(MESSAGE, m)
+          case _ =>
+        }
+        attempt match {
+          case Some(a: Integer) => doc.update(ATTEMPT, BsonInt32(a))
+          case _ =>
+        }
+        isFailure match {
+          case Some(f: Boolean) => doc.update(IS_FAILURE, BsonBoolean(f))
+          case _ =>
+        }
 
-          query.setConsistencyLevel(ConsistencyLevel.valueOf(config.cassandraConsistency()))
-            .asInstanceOf[RegularStatement]
+        val collection: MongoCollection[MutableDocument] = client.getDatabase(config.mongoDatabase()).getCollection(config.mongoCollection())
 
-          session.executeAsync(query)
-      }
-    } catch {
-      case e: NoHostAvailableException =>
-        resetSession()
-        log.log(Level.WARNING, "No hosts were available, will retry next time.", e)
-      case e: QueryExecutionException =>
-        log.log(Level.WARNING,"Query execution failed: ", e)
-      case e: QueryValidationException =>
-        log.log(Level.WARNING,"Query validation failed: ", e)
+        collection.insertOne(doc).subscribe(
+          (result: Completed) => {},
+          (e: Throwable) => {
+            log.log(Level.WARNING, "Insert Mongodb error", e)
+            closeClient()
+          }
+        )
     }
-
   }
 
-  private def readConsistencyLevel() : ConsistencyLevel = {
-    if (ConsistencyLevel.ANY.name().equalsIgnoreCase(config.cassandraConsistency())) {
-      //reads do not support ANY
-      ConsistencyLevel.ONE
-    } else {
-      ConsistencyLevel.valueOf(config.cassandraConsistency())
+  private def getClient: Option[MongoClient] = {
+    _mongoClient match {
+      case Some(s) => Some(s)
+      case None =>
+        config.mongoConnectionString.get match {
+          case Some(c) =>
+            val client = MongoClient(c)
+
+            client.getDatabase(config.mongoDatabase()).getCollection(config.mongoCollection()).createIndex(
+              compoundIndex(text(JOB_NAME), text(TASK_ID))
+            ).subscribe(
+              (result: String) => {},
+              (e: Throwable) => log.log(Level.WARNING, "Create Mongodb index error", e)
+            )
+
+            client.getDatabase(config.mongoDatabase()).getCollection(config.mongoStatCountCollection()).createIndex(
+              compoundIndex(text(JOB_NAME), text(TASK_ID))
+            ).subscribe(
+              (result: String) => {},
+              (e: Throwable) => log.log(Level.WARNING, "Create Mongodb index error", e)
+            )
+
+            _mongoClient = Some(client)
+            _mongoClient
+          case None => None
+        }
     }
+  }
+
+  private def closeClient(): Unit = {
+    _mongoClient match {
+      case Some(client) =>
+        client.close()
+      case _ =>
+    }
+    _mongoClient = None
   }
 }
